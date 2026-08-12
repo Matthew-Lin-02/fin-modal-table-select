@@ -5,29 +5,75 @@ declare(strict_types=1);
 namespace FinityLabs\FinModalTableSelect\Concerns;
 
 use Closure;
-use Filament\Support\Contracts\HasColor;
-use Filament\Support\Contracts\HasLabel;
+use Filament\Forms\Components\TableSelect\Livewire\TableSelectLivewireComponent;
+use Filament\Infolists\Components\IconEntry;
+use Filament\Infolists\Components\ImageEntry;
+use Filament\Infolists\Components\RepeatableEntry;
+use Filament\Infolists\Components\RepeatableEntry\TableColumn;
+use Filament\Infolists\Components\TextEntry;
+use Filament\Schemas\Components\Component as SchemaComponent;
+use Filament\Schemas\Schema;
+use Filament\Support\Services\RelationshipJoiner;
 use Filament\Tables\Columns\Column;
+use Filament\Tables\Columns\IconColumn;
+use Filament\Tables\Columns\ImageColumn;
 use Filament\Tables\Columns\TextColumn;
+use Filament\Tables\Table;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Collection as EloquentCollection;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\Relation;
+use Throwable;
 
 trait HasTableDisplay
 {
-    /** @var array<Column>|Closure|null */
+    /** @var array<TableColumn>|Closure|null */
     protected array|Closure|null $tableColumns = null;
 
-    protected bool|Closure $isTableStriped = false;
+    /** @var array<SchemaComponent>|Closure|null */
+    protected array|Closure|null $tableSchema = null;
+
+    protected bool|Closure $isDisplayAsTable = false;
 
     protected string|Closure|null $tableEmptyMessage = null;
 
     /** @var array<string>|Closure|null */
     protected array|Closure|null $tableEagerLoad = null;
 
+    protected ?Closure $tableModifyQueryUsing = null;
+
+    protected bool|Closure $hasTableFooterCount = false;
+
+    protected bool|Closure $isTableCollapsible = false;
+
+    protected bool|Closure $isTableCollapsed = false;
+
+    protected ?EloquentCollection $cachedSelectedRecords = null;
+
+    protected ?string $cachedSelectedRecordsKey = null;
+
+    /** @var array{columns: array<TableColumn>, entries: array<SchemaComponent>}|null */
+    protected ?array $cachedInheritedTableDisplay = null;
+
     /**
-     * Define the columns displayed in the selected items table.
+     * Display the selected records as a table. With no explicit tableColumns()
+     * or tableSchema(), the columns are inherited from the modal's
+     * tableConfiguration() class — same table inside and outside the modal.
+     */
+    public function displayAsTable(bool|Closure $condition = true): static
+    {
+        $this->isDisplayAsTable = $condition;
+
+        return $this;
+    }
+
+    /**
+     * Define the header columns for the selected items table.
      *
-     * @param  array<Column>|Closure  $columns
+     * These are infolist RepeatableEntry table columns; their order lines up
+     * with the entries passed to tableSchema().
+     *
+     * @param  array<TableColumn>|Closure  $columns
      */
     public function tableColumns(array|Closure $columns): static
     {
@@ -36,9 +82,16 @@ trait HasTableDisplay
         return $this;
     }
 
-    public function tableStriped(bool|Closure $condition = true): static
+    /**
+     * Define the infolist entries rendered for each row of the selected items
+     * table. Because these are real infolist entries, Filament applies their
+     * formatting (badge(), date(), money(), etc.) for us.
+     *
+     * @param  array<SchemaComponent>|Closure  $schema
+     */
+    public function tableSchema(array|Closure $schema): static
     {
-        $this->isTableStriped = $condition;
+        $this->tableSchema = $schema;
 
         return $this;
     }
@@ -62,26 +115,49 @@ trait HasTableDisplay
         return $this;
     }
 
-    /** @return array<Column> */
-    public function getTableColumns(): array
+    /**
+     * Modify the query used to load the selected records for table display.
+     *
+     * Useful for aggregates the row entries reference, for example:
+     * fn (Builder $query) => $query->withSum('timeEntries', 'duration_minutes').
+     */
+    public function tableModifyQueryUsing(?Closure $callback): static
     {
-        $columns = $this->evaluate($this->tableColumns);
+        $this->tableModifyQueryUsing = $callback;
 
-        if ($columns === null) {
-            $titleAttribute = $this->getRelationshipTitleAttribute();
-
-            return [
-                TextColumn::make($titleAttribute ?? 'id')
-                    ->label(str($titleAttribute ?? 'ID')->headline()->toString()),
-            ];
-        }
-
-        return $columns;
+        return $this;
     }
 
-    public function getIsTableStriped(): bool
+    /**
+     * Show a footer beneath the table displaying the selected row count.
+     */
+    public function tableFooterCount(bool|Closure $condition = true): static
     {
-        return (bool) $this->evaluate($this->isTableStriped);
+        $this->hasTableFooterCount = $condition;
+
+        return $this;
+    }
+
+    /**
+     * Render the selected items table inside a collapsible region with a
+     * show/hide toggle.
+     */
+    public function tableCollapsible(bool|Closure $condition = true): static
+    {
+        $this->isTableCollapsible = $condition;
+
+        return $this;
+    }
+
+    /**
+     * Start the collapsible table in its collapsed (hidden) state. Has no
+     * effect unless tableCollapsible() is enabled.
+     */
+    public function tableCollapsed(bool|Closure $condition = true): static
+    {
+        $this->isTableCollapsed = $condition;
+
+        return $this;
     }
 
     public function getTableEmptyMessage(): string
@@ -90,93 +166,225 @@ trait HasTableDisplay
             ?? __('fin-modal-table-select::modal-table-select.empty_message');
     }
 
-    public function hasTableColumns(): bool
+    public function getHasTableFooterCount(): bool
     {
-        return $this->tableColumns !== null;
+        return (bool) $this->evaluate($this->hasTableFooterCount);
+    }
+
+    public function getIsTableCollapsible(): bool
+    {
+        return (bool) $this->evaluate($this->isTableCollapsible);
+    }
+
+    public function getIsTableCollapsed(): bool
+    {
+        return (bool) $this->evaluate($this->isTableCollapsed);
     }
 
     /**
-     * Retrieve the full Eloquent models for the currently selected IDs.
+     * Table display is active when explicitly enabled via displayAsTable()
+     * or when custom columns/schema are configured.
+     */
+    public function hasTableDisplay(): bool
+    {
+        return ($this->tableColumns !== null)
+            || ($this->tableSchema !== null)
+            || ((bool) $this->evaluate($this->isDisplayAsTable));
+    }
+
+    /** @return array<TableColumn> */
+    public function getTableColumns(): array
+    {
+        $columns = $this->evaluate($this->tableColumns);
+
+        if ($columns !== null) {
+            return $columns;
+        }
+
+        return $this->getInheritedTableDisplay()['columns'];
+    }
+
+    /** @return array<SchemaComponent> */
+    public function getTableSchema(): array
+    {
+        $schema = $this->evaluate($this->tableSchema);
+
+        if ($schema !== null) {
+            return $schema;
+        }
+
+        return $this->getInheritedTableDisplay()['entries'];
+    }
+
+    /**
+     * Derive selected-items table columns and row entries from the modal's
+     * tableConfiguration() class, so displayAsTable() works with zero extra
+     * configuration.
+     *
+     * @return array{columns: array<TableColumn>, entries: array<SchemaComponent>}
+     */
+    protected function getInheritedTableDisplay(): array
+    {
+        if ($this->cachedInheritedTableDisplay !== null) {
+            return $this->cachedInheritedTableDisplay;
+        }
+
+        try {
+            $configuration = $this->getTableConfiguration();
+
+            $table = Table::make(app(TableSelectLivewireComponent::class));
+            $configuration::configure($table);
+        } catch (Throwable) {
+            return $this->cachedInheritedTableDisplay = ['columns' => [], 'entries' => []];
+        }
+
+        $columns = [];
+        $entries = [];
+
+        foreach ($table->getColumns() as $column) {
+            if ($column->isHidden()) {
+                continue;
+            }
+
+            $columns[] = TableColumn::make((string) $column->getLabel());
+            $entries[] = $this->makeEntryForTableColumn($column);
+        }
+
+        return $this->cachedInheritedTableDisplay = ['columns' => $columns, 'entries' => $entries];
+    }
+
+    protected function makeEntryForTableColumn(Column $column): SchemaComponent
+    {
+        $name = $column->getName();
+
+        if ($column instanceof ImageColumn) {
+            return ImageEntry::make($name)->hiddenLabel();
+        }
+
+        if ($column instanceof IconColumn) {
+            return IconEntry::make($name)->hiddenLabel();
+        }
+
+        $entry = TextEntry::make($name)->hiddenLabel();
+
+        if (($column instanceof TextColumn) && $column->isBadge()) {
+            $entry->badge();
+        }
+
+        return $entry;
+    }
+
+    /**
+     * Retrieve the full Eloquent models for the currently selected IDs, in
+     * selection order. Uses the same relationship query strategy as the parent
+     * component and memoizes per state, so repeated calls within a render are
+     * free.
      *
      * @return EloquentCollection<int, Model>
      */
-    public function getRecords(): EloquentCollection
+    public function getSelectedRecords(): EloquentCollection
     {
         $state = $this->getState();
+        $ids = array_values(array_filter(
+            is_array($state) ? $state : [$state],
+            fn ($id): bool => filled($id),
+        ));
 
-        if (empty($state)) {
+        if (blank($ids)) {
             return new EloquentCollection;
         }
 
-        $ids = is_array($state) ? $state : [$state];
+        $ids = array_map(strval(...), $ids);
+        $cacheKey = implode(',', $ids);
 
-        $relationship = $this->getRelationship();
-        $relatedModel = $relationship->getRelated();
-        $keyName = $relatedModel->getKeyName();
-
-        $query = $relatedModel->newQuery()->whereIn($keyName, $ids);
-
-        $eagerLoad = $this->evaluate($this->tableEagerLoad);
-
-        if (! empty($eagerLoad)) {
-            $query->with($eagerLoad);
+        if (($this->cachedSelectedRecordsKey === $cacheKey) && ($this->cachedSelectedRecords !== null)) {
+            return $this->cachedSelectedRecords;
         }
 
-        return $query->get();
-    }
+        if ($this->getIsStandalone()) {
+            $query = $this->getStandaloneQuery()->whereKey($ids);
+        } else {
+            $relationship = Relation::noConstraints(fn (): Relation => $this->getRelationship());
 
-    /**
-     * Resolve a column value from a record, supporting dot notation.
-     */
-    public function resolveColumnValue(Model $record, string $name): mixed
-    {
-        return data_get($record, $name);
-    }
+            $query = app(RelationshipJoiner::class)->prepareQueryForNoConstraints($relationship);
 
-    /**
-     * Resolve display data for a column cell from a record.
-     *
-     * Returns an array with 'label', 'isBadge', and 'color' keys so the
-     * blade view can render it. We can't use Column::toEmbeddedHtml()
-     * because the column pipeline requires a mounted Table/Livewire context.
-     *
-     * @return array{label: string, isBadge: bool, color: string|null}
-     */
-    public function resolveColumnCell(Column $column, Model $record): array
-    {
-        $value = data_get($record, $column->getName());
-        $isBadge = method_exists($column, 'isBadge') && $column->isBadge();
-        $color = null;
-        $label = $value;
+            $query->whereIn($this->getQualifiedRelatedKeyNameForRelationship($relationship), $ids);
 
-        // Handle enums with Filament's HasLabel/HasColor interfaces
-        if ($value instanceof \BackedEnum) {
-            $label = $value instanceof HasLabel
-                ? ($value->getLabel() ?? $value->value)
-                : $value->value;
-        } elseif ($value instanceof \UnitEnum) {
-            $label = $value->name;
-        } elseif ($value instanceof HasLabel) {
-            $label = $value->getLabel();
-        }
-
-        if ($value instanceof HasColor) {
-            $color = $value->getColor();
-        }
-
-        // If no color from enum, try the column's color config
-        if ($color === null && method_exists($column, 'getColor')) {
-            try {
-                $color = $column->getColor($value);
-            } catch (\Throwable) {
-                // Column may need table context for closure evaluation
+            if ($this->modifyRelationshipQueryUsing) {
+                $query = $this->evaluate($this->modifyRelationshipQueryUsing, [
+                    'query' => $query,
+                ], [
+                    Builder::class => $query,
+                ]) ?? $query;
             }
         }
 
-        return [
-            'label' => (string) ($label ?? '—'),
-            'isBadge' => $isBadge,
-            'color' => $color,
-        ];
+        $eagerLoad = $this->evaluate($this->tableEagerLoad);
+
+        if (filled($eagerLoad)) {
+            $query->with($eagerLoad);
+        }
+
+        if ($this->tableModifyQueryUsing !== null) {
+            $query = $this->evaluate($this->tableModifyQueryUsing, [
+                'query' => $query,
+            ], [
+                Builder::class => $query,
+            ]) ?? $query;
+        }
+
+        $records = $query->get()
+            ->sortBy(fn (Model $record): int => (int) array_search((string) $record->getKey(), $ids, strict: true))
+            ->values();
+
+        $this->cachedSelectedRecordsKey = $cacheKey;
+
+        return $this->cachedSelectedRecords = $records;
+    }
+
+    /**
+     * Re-resolve the selected records, bypassing the memoized result. Used
+     * after the state has just changed (e.g. inside afterStateUpdated).
+     *
+     * @return EloquentCollection<int, Model>
+     */
+    public function getFreshSelectedRecords(): EloquentCollection
+    {
+        $this->cachedSelectedRecords = null;
+        $this->cachedSelectedRecordsKey = null;
+
+        return $this->getSelectedRecords();
+    }
+
+    /**
+     * Build the schema that renders the selected records as a table. Each row
+     * is a RepeatableEntry item bound to the record model itself, so entries
+     * resolve dot-notation relationships, casts, and enums natively.
+     */
+    public function makeSelectedTableSchema(): ?Schema
+    {
+        $records = $this->getSelectedRecords();
+
+        if ($records->isEmpty()) {
+            return null;
+        }
+
+        $entries = $this->getTableSchema();
+
+        if (blank($entries)) {
+            return null;
+        }
+
+        $entryName = 'finSelectedTable';
+
+        $repeatable = RepeatableEntry::make($entryName)
+            ->table($this->getTableColumns())
+            ->schema($entries)
+            ->contained(false)
+            ->hiddenLabel();
+
+        return Schema::make($this->getLivewire())
+            ->components([$repeatable])
+            ->constantState([$entryName => $records->all()]);
     }
 }
