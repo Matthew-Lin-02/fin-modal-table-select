@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace FinityLabs\FinModalTableSelect\Components;
 
 use Filament\Forms\Components\TableSelect;
-use Filament\Support\View\ComponentAttributeBag as FilamentComponentAttributeBag;
+use Illuminate\View\ComponentAttributeBag;
 use FinityLabs\FinModalTableSelect\Livewire\StandaloneRecordsTableSelectComponent;
 use Livewire\Livewire;
 
@@ -17,6 +17,11 @@ use Livewire\Livewire;
  */
 class StandaloneRecordsTableSelect extends TableSelect
 {
+    public function toHtml(): string
+    {
+        return $this->toEmbeddedHtml();
+    }
+    
     public function toEmbeddedHtml(): string
     {
         $extraAttributes = $this->getExtraAttributes();
@@ -37,7 +42,7 @@ class StandaloneRecordsTableSelect extends TableSelect
 
         $livewireHtml = Livewire::mount(StandaloneRecordsTableSelectComponent::class, $properties, $this->getLivewireKey());
 
-        $attributes = (new FilamentComponentAttributeBag)
+        $attributes = (new ComponentAttributeBag)
             ->merge([
                 'aria-labelledby' => "{$id}-label",
                 'id' => $id,
@@ -45,6 +50,5 @@ class StandaloneRecordsTableSelect extends TableSelect
             ], escape: false)
             ->merge($extraAttributes, escape: false);
 
-        return $this->wrapEmbeddedHtml('<div '.$attributes->toHtml().'>'.$livewireHtml.'</div>', labelTag: 'div');
+        return '<div '.$attributes->toHtml().'>'.$livewireHtml.'</div>';    
     }
-}
